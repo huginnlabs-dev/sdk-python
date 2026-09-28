@@ -1,0 +1,47 @@
+"""HuginnLabs Dataflow SDK for Python.
+
+One import auto-configures the SDK from DATAFLOW_* environment variables and
+starts a background gRPC streaming client that ships trace events to the
+SaaS ingestion endpoint, mirroring the Go SDK wire-for-wire:
+
+    import dataflow          # auto-configures from the environment
+
+    from fastapi import FastAPI
+    import dataflow
+
+    app = FastAPI()
+    app.add_middleware(dataflow.ASGIMiddleware)
+
+    @app.post("/ship")
+    async def ship(req: ShipRequest):
+        with dataflow.trace("warehouse.Reserve") as span:
+            span.set_data("request", req.model_dump())
+            ...
+"""
+
+from .config import configure, settings, enabled
+from .spans import (
+    Span,
+    start_span,
+    trace,
+    traced,
+    span_from_context,
+    current_span,
+)
+from .middleware import ASGIMiddleware
+from .client import http_client
+
+__all__ = [
+    "configure",
+    "settings",
+    "enabled",
+    "Span",
+    "start_span",
+    "trace",
+    "traced",
+    "span_from_context",
+    "current_span",
+    "ASGIMiddleware",
+    "http_client",
+]
+__version__ = "0.1.0"
