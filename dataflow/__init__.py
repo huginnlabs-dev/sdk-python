@@ -31,6 +31,7 @@ from .spans import (
 from .middleware import ASGIMiddleware
 from .client import http_client
 from .transport import db_span, instrument_requests
+from .crash import capture_exceptions, capture_uncaught, ignore_uncaught
 
 __all__ = [
     "configure",
@@ -46,5 +47,8 @@ __all__ = [
     "http_client",
     "db_span",
     "instrument_requests",
+    "capture_exceptions",
+    "capture_uncaught",
+    "ignore_uncaught",
 ]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -47,6 +47,36 @@ clear `ImportError` only when it is missing. Both helpers are best-effort:
 with tracing disabled (no API key/endpoint, or `DATAFLOW_DISABLED`) they
 produce no spans and never disturb the calls they wrap.
 
+## Exception capture
+
+```python
+import dataflow
+
+with dataflow.capture_exceptions():
+    do_work()   # any exception raised here is recorded, then re-raised
+```
+
+A raised exception is recorded on the enclosing span (a `dataflow.trace`
+block, an HTTP server span, ...) or, when none is active, on a short-lived
+synthetic `exception` span: status 500, `error_message` carrying the
+`"Type: message"` repr truncated to 500 characters, and `error.stack` with
+the formatted traceback capped at 8192 bytes (the top of the traceback is
+kept). The exception is never swallowed — it re-raises after recording, and
+a recording failure can never mask the original exception.
+
+`dataflow.capture_uncaught()` installs `sys.excepthook` /
+`threading.excepthook` wrappers so crashes that escape to the interpreter
+still land on a synthetic `uncaught exception` span; the previous hooks are
+chained afterwards, preserving existing behaviour. `dataflow.ignore_uncaught()`
+restores the originals.
+
+WSGI/ASGI: most frameworks intercept handler exceptions and render a 500
+response before Dataflow would see them, so wrap the inner app call — e.g.
+`with dataflow.capture_exceptions(): await self.app(scope, receive, send)`
+in a thin ASGI middleware, or the WSGI callable invocation on the WSGI side.
+`ASGIMiddleware` already records the exception message on its HTTP_SERVER
+span; nesting `capture_exceptions()` adds `error.stack`.
+
 ## Route scanning
 
 `python -m dataflow.scan` statically extracts the HTTP endpoints a service

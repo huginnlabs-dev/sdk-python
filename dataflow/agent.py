@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 _lock = threading.Lock()
 _attrs: list[tuple[str, str]] | None = None
