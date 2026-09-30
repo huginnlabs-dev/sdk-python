@@ -34,6 +34,7 @@ T = TypeVar("T")
 
 EVENT_HTTP_SERVER = "HTTP_SERVER"
 EVENT_HTTP_CLIENT = "HTTP_CLIENT"
+EVENT_DB_QUERY = "DB_QUERY"
 EVENT_FUNC_CALL = "FUNCTION_CALL"
 EVENT_GRPC = "GRPC"
 
@@ -127,6 +128,8 @@ class Span:
                 EVENT_HTTP_CLIENT: pb.EVENT_TYPE_HTTP_CLIENT,
                 EVENT_GRPC: pb.EVENT_TYPE_GRPC,
                 EVENT_FUNC_CALL: pb.EVENT_TYPE_FUNCTION_CALL,
+                # Wire value 6; used directly when local stubs predate the enum.
+                EVENT_DB_QUERY: getattr(pb, "EVENT_TYPE_DB_QUERY", 6),
             }
             self.ev.type = mapping.get(event_type, pb.EVENT_TYPE_FUNCTION_CALL)
         return self

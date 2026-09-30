@@ -30,6 +30,7 @@ from .spans import (
 )
 from .middleware import ASGIMiddleware
 from .client import http_client
+from .transport import db_span, instrument_requests
 
 __all__ = [
     "configure",
@@ -43,5 +44,7 @@ __all__ = [
     "current_span",
     "ASGIMiddleware",
     "http_client",
+    "db_span",
+    "instrument_requests",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

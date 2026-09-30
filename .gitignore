@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# generated during the Docker build (grpcio-tools) — see README.md
+dataflow/proto_gen/
