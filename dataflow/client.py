@@ -13,6 +13,7 @@ import grpc
 
 from .buffer import EventBuffer
 from .config import enabled, settings
+from .manifest import send_manifest
 from .spans import encryption_envelope
 
 try:
@@ -59,6 +60,9 @@ def ensure_started() -> None:
         thread = threading.Thread(target=_run, name="dataflow-sender", daemon=True)
         thread.start()
         _started = True
+        # Report the service manifest (framework + dependency inventory)
+        # once; best-effort, independent of the tracing pipeline.
+        send_manifest()
 
 
 def enqueue(ev) -> None:
