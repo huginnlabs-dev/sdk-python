@@ -32,6 +32,17 @@ from .middleware import ASGIMiddleware
 from .client import http_client
 from .transport import db_span, instrument_requests
 from .crash import capture_exceptions, capture_uncaught, ignore_uncaught
+from .logs import (
+    DataflowLogHandler,
+    debug,
+    error,
+    flush_logs,
+    info,
+    install_log_handler,
+    log,
+    remove_log_handler,
+    warn,
+)
 
 __all__ = [
     "configure",
@@ -50,5 +61,14 @@ __all__ = [
     "capture_exceptions",
     "capture_uncaught",
     "ignore_uncaught",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "log",
+    "install_log_handler",
+    "remove_log_handler",
+    "flush_logs",
+    "DataflowLogHandler",
 ]
-__version__ = "0.5.0"
+__version__ = "0.6.0"

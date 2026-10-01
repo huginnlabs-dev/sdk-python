@@ -77,6 +77,47 @@ in a thin ASGI middleware, or the WSGI callable invocation on the WSGI side.
 `ASGIMiddleware` already records the exception message on its HTTP_SERVER
 span; nesting `capture_exceptions()` adds `error.stack`.
 
+## Log capture
+
+```python
+import dataflow
+
+dataflow.debug("cache miss", key=user_key)
+dataflow.info("order reserved", order_id=order_id)
+dataflow.warn("retrying", attempt=2)
+dataflow.error("payment failed", code=resp.status)
+dataflow.log("warn", "level spelled out")
+```
+
+Every record is stamped with the current span's trace/span ids (empty when
+none is active), the service name, a unix-millisecond timestamp, and the
+keyword fields stringified (at most 50). Records buffer in memory (1024
+records, drop-oldest) and a background flusher ships them in batches of at
+most 1000 to `POST /api/v1/logs` every 500 ms, or as soon as 50 records are
+buffered. Delivery is best-effort: a 5 s timeout, one retry per batch, then
+the batch is dropped — the helpers never block or raise.
+`dataflow.flush_logs()` forces a synchronous flush and returns how many
+records reached the wire.
+
+Standard-library logging can ship alongside, without changing behaviour:
+
+```python
+dataflow.install_log_handler()          # root logger
+dataflow.install_log_handler("app")     # or a logger by name / object
+dataflow.remove_log_handler()           # detach again
+```
+
+The handler only taps records — `propagate` and the logger's other handlers
+are untouched — forwarding the level (`WARNING` becomes `warn`), the
+formatted message, and any `extra=` fields that can be stringified.
+Captured records carry the same trace ids as spans, so log lines and traces
+line up in the Dataflow UI's Logs tab. Installing is idempotent per logger;
+`remove_log_handler` restores the previous setup.
+
+With logging disabled (no API key/endpoint, `DATAFLOW_DISABLED`, or a bare
+`host:port` `DATAFLOW_ENDPOINT` without a `DATAFLOW_HTTP_URL` override) the
+helpers are no-ops and no handler is installed.
+
 ## Route scanning
 
 `python -m dataflow.scan` statically extracts the HTTP endpoints a service
