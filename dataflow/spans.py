@@ -8,6 +8,7 @@ across ``await`` points.
 from __future__ import annotations
 
 import contextvars
+import functools
 import inspect
 import json
 import random
@@ -258,6 +259,7 @@ def trace(name: str) -> Span:
             _current_span.reset(self_inner._token)
             if exc is not None:
                 span.record_error(exc)
+                span.set_status(500)  # same contract as db_span / capture_exceptions
             span.end()
             return False
 
@@ -268,21 +270,30 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def traced(name: Optional[str] = None) -> Callable[[F], F]:
-    """Decorator flavour of trace(); sync and async functions both work."""
+    """Decorator flavour of trace(); sync and async functions both work.
+
+    Opens a FUNCTION_CALL child of the enclosing span, records errors on it
+    (status 500 + ``error_message``, mirroring ``capture_exceptions``) and
+    re-raises. Works on methods (``self`` passes through untouched) and keeps
+    the wrapped function's ``__name__``/``__qualname__`` via functools.wraps,
+    so stacking or re-decorating stays well-behaved.
+    """
 
     def decorate(fn: F) -> F:
         label = name or f"{fn.__module__.split('.')[0]}.{fn.__qualname__}"
 
         if inspect.iscoroutinefunction(fn):
 
+            @functools.wraps(fn)
             async def async_wrapper(*args, **kwargs):
-                with trace(label) as span:
+                with trace(label):
                     return await fn(*args, **kwargs)
 
             return async_wrapper  # type: ignore[return-value]
 
+        @functools.wraps(fn)
         def sync_wrapper(*args, **kwargs):
-            with trace(label) as span:
+            with trace(label):
                 return fn(*args, **kwargs)
 
         return sync_wrapper  # type: ignore[return-value]

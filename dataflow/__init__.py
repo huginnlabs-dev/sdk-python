@@ -31,6 +31,14 @@ from .spans import (
 from .middleware import ASGIMiddleware
 from .client import http_client
 from .transport import db_span, instrument_requests
+from . import django_middleware
+from .contrib import (
+    DataflowMiddleware,
+    instrument_asyncpg,
+    instrument_psycopg,
+    instrument_sqlalchemy,
+    uninstrument_sqlalchemy,
+)
 from .crash import capture_exceptions, capture_uncaught, ignore_uncaught
 from .logs import (
     DataflowLogHandler,
@@ -58,6 +66,11 @@ __all__ = [
     "http_client",
     "db_span",
     "instrument_requests",
+    "instrument_sqlalchemy",
+    "uninstrument_sqlalchemy",
+    "instrument_psycopg",
+    "instrument_asyncpg",
+    "DataflowMiddleware",
     "capture_exceptions",
     "capture_uncaught",
     "ignore_uncaught",
@@ -71,4 +84,4 @@ __all__ = [
     "flush_logs",
     "DataflowLogHandler",
 ]
-__version__ = "0.6.0"
+__version__ = "0.7.0"

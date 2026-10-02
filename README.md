@@ -47,6 +47,66 @@ clear `ImportError` only when it is missing. Both helpers are best-effort:
 with tracing disabled (no API key/endpoint, or `DATAFLOW_DISABLED`) they
 produce no spans and never disturb the calls they wrap.
 
+## Library integrations
+
+`dataflow.contrib` instruments the common database and web frameworks. All
+integrations share the wire contract: database calls emit DB_QUERY spans
+named `"SELECT orders"` (verb + first table), `db.system` carries the
+engine, `db.statement` the single-spaced statement truncated to 200
+characters — bind parameter values are never captured — and everything is
+best-effort and disabled-state inert. Third-party packages are imported
+lazily, so a missing library only raises a clear `ImportError` when its
+instrument function is called.
+
+```python
+import dataflow
+
+# SQLAlchemy: every statement through the engine (Core or ORM, sync or
+# async) gets a DB_QUERY span; db.dialect carries engine.dialect.name.
+dataflow.instrument_sqlalchemy(engine)        # or a sessionmaker
+dataflow.uninstrument_sqlalchemy(engine)      # undo; idempotent per engine
+
+# psycopg 3: Connection.execute, or every connection handed out by a pool.
+dataflow.instrument_psycopg(conn)             # db.system="postgres"
+dataflow.instrument_psycopg(pool)
+
+# asyncpg: execute/fetch/fetchrow/fetchval on a connection, or every
+# connection coming out of `async with pool.acquire()`.
+dataflow.instrument_asyncpg(pool)
+```
+
+### Django
+
+```python
+# settings.py
+MIDDLEWARE = [
+    ...
+    "dataflow.django_middleware.DataflowMiddleware",
+]
+```
+
+One HTTP_SERVER span per request, opened as `"METHOD path"` and renamed to
+`"METHOD route"` (with `http.route` metadata) once URL resolution has
+filled `request.resolver_match`. The response status becomes the span
+status, exceptions are recorded (status 500) and re-raised. Combine with
+`instrument_sqlalchemy(engine)` and query spans nest under the request
+span automatically. The middleware is duck-typed — `dataflow` never
+imports Django.
+
+### Traced decorator
+
+```python
+@dataflow.traced("couriers.Quote")
+async def quote(weight_kg: float) -> float: ...
+
+@dataflow.traced()                            # name defaults to pkg.qualname
+def reserve(sku: str) -> None: ...
+```
+
+Works on sync and async functions and methods, opens a FUNCTION_CALL child
+of the enclosing span, records errors on it (status 500 + `error_message`,
+like `capture_exceptions`) and re-raises.
+
 ## Exception capture
 
 ```python
