@@ -35,8 +35,12 @@ from . import django_middleware
 from .contrib import (
     DataflowMiddleware,
     instrument_asyncpg,
+    instrument_celery,
+    instrument_httpx,
     instrument_psycopg,
     instrument_sqlalchemy,
+    restore_httpx,
+    uninstrument_celery,
     uninstrument_sqlalchemy,
 )
 from .crash import capture_exceptions, capture_uncaught, ignore_uncaught
@@ -70,6 +74,10 @@ __all__ = [
     "uninstrument_sqlalchemy",
     "instrument_psycopg",
     "instrument_asyncpg",
+    "instrument_httpx",
+    "restore_httpx",
+    "instrument_celery",
+    "uninstrument_celery",
     "DataflowMiddleware",
     "capture_exceptions",
     "capture_uncaught",
@@ -84,4 +92,4 @@ __all__ = [
     "flush_logs",
     "DataflowLogHandler",
 ]
-__version__ = "0.7.0"
+__version__ = "0.8.0"

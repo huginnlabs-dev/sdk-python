@@ -49,7 +49,8 @@ produce no spans and never disturb the calls they wrap.
 
 ## Library integrations
 
-`dataflow.contrib` instruments the common database and web frameworks. All
+`dataflow.contrib` instruments the common databases, HTTP clients, task
+queues and web frameworks. All
 integrations share the wire contract: database calls emit DB_QUERY spans
 named `"SELECT orders"` (verb + first table), `db.system` carries the
 engine, `db.statement` the single-spaced statement truncated to 200
@@ -73,6 +74,20 @@ dataflow.instrument_psycopg(pool)
 # asyncpg: execute/fetch/fetchrow/fetchval on a connection, or every
 # connection coming out of `async with pool.acquire()`.
 dataflow.instrument_asyncpg(pool)
+
+# httpx: one HTTP_CLIENT span per request ("GET api.example.com/orders",
+# http.method / http.url, response status), the X-Dataflow-Trace-Id request
+# header so downstream services join the trace, and failures recorded with
+# status 500 + error.stack. The SDK's own ingest endpoints are never traced.
+dataflow.instrument_httpx(client)     # one Client / AsyncClient (event hooks)
+dataflow.instrument_httpx()           # or patch httpx.Client/AsyncClient
+dataflow.restore_httpx()              # undo (restore_httpx(client) for one)
+
+# celery: every task becomes a FUNCTION_CALL span named after the task
+# ("tasks.add"); nested spans parent to it, the task state closes the span,
+# and failures are recorded with status 500 + error.stack.
+dataflow.instrument_celery()          # task_prerun/postrun/failure signals
+dataflow.uninstrument_celery()        # undo; idempotent
 ```
 
 ### Django

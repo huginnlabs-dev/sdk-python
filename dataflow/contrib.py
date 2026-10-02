@@ -1,12 +1,14 @@
-"""Optional library integrations: SQLAlchemy, psycopg3, asyncpg, Django.
+"""Optional library integrations: SQLAlchemy, psycopg3, asyncpg, Django,
+httpx, celery.
 
 All of these ride the existing span pipeline: database calls emit DB_QUERY
 spans through :func:`dataflow.transport.db_span` semantics (name from
 :func:`dataflow.transport.stmt_summary` — ``"SELECT orders"`` —, ``db.system``
 metadata, single-spaced statement truncated to 200 characters in
-``db.statement``, bind parameter values never captured) and HTTP requests
-emit HTTP_SERVER spans like ``ASGIMiddleware`` does. Nested spans parent to
-them automatically via the usual contextvars.
+``db.statement``, bind parameter values never captured), HTTP requests emit
+HTTP_SERVER / HTTP_CLIENT spans like ``ASGIMiddleware`` /
+``instrument_requests`` do, and tasks emit FUNCTION_CALL spans. Nested spans
+parent to them automatically via the usual contextvars.
 
 - :func:`instrument_sqlalchemy` listens on the Engine's
   ``before_cursor_execute`` / ``after_cursor_execute`` / ``handle_error``
@@ -17,6 +19,14 @@ them automatically via the usual contextvars.
   pool's ``getconn`` so every checked-out connection is instrumented.
 - :func:`instrument_asyncpg` wraps ``execute`` / ``fetch`` / ``fetchrow`` /
   ``fetchval`` on a connection, or the pool's ``acquire`` context manager.
+- :func:`instrument_httpx` attaches event hooks to a given ``httpx.Client``
+  / ``AsyncClient`` (or patches the classes globally) so every outgoing call
+  emits an HTTP_CLIENT span and carries the ``X-Dataflow-Trace-Id`` header;
+  the SDK's own ingest endpoints are never traced. Undo with
+  :func:`restore_httpx`.
+- :func:`instrument_celery` connects celery's ``task_prerun`` /
+  ``task_postrun`` / ``task_failure`` signals so every task becomes a
+  FUNCTION_CALL span; undo with :func:`uninstrument_celery`.
 - :class:`DataflowMiddleware` is a Django new-style request middleware
   emitting one HTTP_SERVER span per request, named after
   ``request.resolver_match.route`` when URL resolution has produced one.
@@ -25,7 +35,9 @@ Third-party packages are imported lazily — a missing library raises a clear
 ImportError only when its instrument function is called. Everything is
 best-effort: with tracing disabled (no API key/endpoint, or
 DATAFLOW_DISABLED) the hooks install but produce no spans and the
-instrumented calls behave exactly as they would without Dataflow.
+instrumented calls behave exactly as they would without Dataflow. Signal
+receivers and wrappers never raise, so the remaining handlers in a chain
+(other celery receivers, user event hooks) always still run.
 """
 
 from __future__ import annotations
@@ -34,19 +46,32 @@ import functools
 import inspect
 import threading
 import time
+import traceback
 import weakref
 from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import urlsplit
 
 from .agent import agent_attrs
 from .config import enabled
-from .spans import EVENT_HTTP_SERVER, start_span
-from .transport import db_span
+from .crash import MESSAGE_MAX_CHARS, STACK_ATTR, _clip_stack
+from .spans import (
+    EVENT_FUNC_CALL,
+    EVENT_HTTP_CLIENT,
+    EVENT_HTTP_SERVER,
+    _current_span,
+    start_span,
+)
+from .transport import TRACE_HEADER, db_span
 
 __all__ = [
     "instrument_sqlalchemy",
     "uninstrument_sqlalchemy",
     "instrument_psycopg",
     "instrument_asyncpg",
+    "instrument_httpx",
+    "restore_httpx",
+    "instrument_celery",
+    "uninstrument_celery",
     "DataflowMiddleware",
 ]
 
@@ -378,6 +403,404 @@ def _instrument_asyncpg_conn(conn: Any) -> Any:
         except Exception:  # noqa: BLE001 - e.g. __slots__ types: skip silently
             continue
     return conn
+
+
+# -- httpx -------------------------------------------------------------------
+
+# The SDK's own ingest endpoints (dataflow.logs POSTs /api/v1/logs,
+# dataflow.manifest POSTs /api/v1/manifest): an instrumented client must
+# never trace the SDK shipping its own telemetry.
+_INGEST_PATHS = frozenset({"/api/v1/logs", "/api/v1/manifest"})
+
+_HTTPX_SPAN_KEY = "dataflow_span"  # request.extensions slot (dataflow.http_client shares it)
+
+_httpx_lock = threading.Lock()
+_httpx_originals: Dict[str, Any] = {}  # "sync" / "async" -> original class send
+
+
+def instrument_httpx(client: Optional[Any] = None) -> Any:
+    """Emit an HTTP_CLIENT span around every ``httpx`` call.
+
+        dataflow.instrument_httpx(client)   # one Client / AsyncClient
+        dataflow.instrument_httpx()         # patch the classes globally
+        dataflow.restore_httpx(client)      # undo (per client / globally)
+
+    Spans are named ``"GET api.example.com/orders"``, carry ``http.method``
+    and ``http.url``, end with the response status, and failures (connect
+    errors, timeouts) record the error with status 500 and an ``error.stack``
+    metadata. The request gains an ``X-Dataflow-Trace-Id`` header so
+    downstream Dataflow services join the same trace, and the span joins the
+    currently active trace like every other span. The SDK's own ingest
+    endpoints (``/api/v1/logs``, ``/api/v1/manifest``) are skipped — no
+    self-tracing.
+
+    For a single client the tracing rides httpx event hooks (request /
+    response), with ``send`` wrapped solely to catch failures — httpx has no
+    error hook; user-registered hooks are preserved and run as before.
+    Globally the ``Client.send`` / ``AsyncClient.send`` methods are patched,
+    covering instances created before the call too. ``httpx`` is imported
+    lazily; a clear ImportError is raised here only when it is not
+    installed. Idempotent per client and at class level. Returns the
+    instrumented client, or ``httpx.Client`` for the global form.
+    """
+    try:
+        import httpx
+    except ImportError as exc:
+        raise ImportError(
+            "dataflow.instrument_httpx requires the 'httpx' package; "
+            "install it with: pip install httpx"
+        ) from exc
+
+    if client is not None:
+        hooks = client.event_hooks
+        # AsyncClient awaits its hooks, so the installed pair must match the
+        # client flavour (sync functions would die with
+        # "TypeError: object NoneType can't be awaited").
+        async_client = inspect.iscoroutinefunction(client.send)
+        req_hook = _httpx_request_hook_async if async_client else _httpx_request_hook
+        resp_hook = _httpx_response_hook_async if async_client else _httpx_response_hook
+        request_hooks = hooks.setdefault("request", [])
+        if req_hook in request_hooks or getattr(client.send, "_dataflow_instrumented", False):
+            return client  # already instrumented: a no-op
+        request_hooks.append(req_hook)
+        hooks.setdefault("response", []).append(resp_hook)
+        # httpx has no error hook: wrap send so failures still complete the
+        # span the request hook opened.
+        client.send = _httpx_error_send(client.send)  # type: ignore[method-assign]
+        return client
+
+    with _httpx_lock:
+        if _httpx_originals:
+            return httpx.Client  # already patched: a no-op
+        _httpx_originals["sync"] = httpx.Client.send
+        _httpx_originals["async"] = httpx.AsyncClient.send
+        httpx.Client.send = _httpx_class_send(_httpx_originals["sync"])
+        httpx.AsyncClient.send = _httpx_class_send(_httpx_originals["async"])
+    return httpx.Client
+
+
+def restore_httpx(client: Optional[Any] = None) -> Any:
+    """Undo :func:`instrument_httpx`: with ``client``, detach the Dataflow
+    hooks and send wrapper from that one client; without, restore the
+    original ``Client.send`` / ``AsyncClient.send``. No-op when nothing is
+    installed (per-client instrumentation survives a global restore)."""
+    try:
+        import httpx
+    except ImportError as exc:
+        raise ImportError(
+            "dataflow.instrument_httpx requires the 'httpx' package; "
+            "install it with: pip install httpx"
+        ) from exc
+
+    if client is not None:
+        hooks = client.event_hooks
+        for event in ("request", "response"):
+            installed = hooks.get(event, [])
+            for hook in (
+                _httpx_request_hook,
+                _httpx_response_hook,
+                _httpx_request_hook_async,
+                _httpx_response_hook_async,
+            ):
+                try:
+                    installed.remove(hook)
+                except ValueError:
+                    pass
+        if "send" in getattr(client, "__dict__", {}):
+            original = getattr(client.send, "_dataflow_original", None)
+            if original is not None:
+                client.send = original  # type: ignore[method-assign]
+        return client
+
+    with _httpx_lock:
+        targets = {"sync": httpx.Client, "async": httpx.AsyncClient}
+        for flavor, original in _httpx_originals.items():
+            targets[flavor].send = original
+        _httpx_originals.clear()
+    return None
+
+
+def _httpx_request_hook(request: Any) -> None:
+    """Event hook (sync clients): open the HTTP_CLIENT span."""
+    _httpx_start(request)
+
+
+def _httpx_response_hook(response: Any) -> None:
+    """Event hook (sync clients): end the span with the response status."""
+    _httpx_finish_ok(response)
+
+
+async def _httpx_request_hook_async(request: Any) -> None:
+    """Event hook (AsyncClient awaits its hooks)."""
+    _httpx_start(request)
+
+
+async def _httpx_response_hook_async(response: Any) -> None:
+    """Event hook (AsyncClient awaits its hooks)."""
+    _httpx_finish_ok(response)
+
+
+def _httpx_start(request: Any) -> Any:
+    """Open the HTTP_CLIENT span for an outgoing request (or return None
+    when disabled, the target is an ingest endpoint, or the span engine
+    failed). Tracing is silent and never blocks the caller."""
+    if not enabled():
+        return None
+    try:
+        url = str(request.url)
+        parts = urlsplit(url)
+        if parts.path in _INGEST_PATHS:
+            return None  # no self-tracing
+        method = str(request.method or "GET").upper()
+        host = parts.hostname or ""
+        span = start_span(f"{method} {host}{parts.path or '/'}", EVENT_HTTP_CLIENT)
+        span.set_attr("http.method", method)
+        span.set_attr("http.url", url)
+        span.ev.callee_package = host
+        request.extensions[_HTTPX_SPAN_KEY] = span
+        # The downstream service joins the same trace via the request header.
+        request.headers[TRACE_HEADER] = span.trace_id
+        return span
+    except Exception:  # noqa: BLE001 - best-effort
+        return None
+
+
+def _httpx_finish_ok(response: Any) -> None:
+    request = getattr(response, "request", None)
+    span = request.extensions.get(_HTTPX_SPAN_KEY) if request is not None else None
+    if span is None:
+        return
+    try:
+        request.extensions[_HTTPX_SPAN_KEY] = None
+        span.set_status(int(getattr(response, "status_code", 0) or 0))
+        span.end()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _httpx_finish_error(exc: BaseException) -> None:
+    request = getattr(exc, "request", None)
+    span = request.extensions.get(_HTTPX_SPAN_KEY) if request is not None else None
+    if span is None:
+        return
+    try:
+        request.extensions[_HTTPX_SPAN_KEY] = None
+        _record_exception(span, exc)
+        span.end()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _record_exception(span: Any, exc: BaseException, tb: Any = None) -> None:
+    """crash-capture conventions on a span: ``"Type: message"`` (clipped to
+    500 chars), status 500, and the formatted traceback under ``error.stack``
+    capped at 8192 bytes with the top kept. ``tb`` overrides the traceback
+    (celery hands the caught traceback through its signal)."""
+    try:
+        span.record_error(f"{type(exc).__name__}: {exc}"[:MESSAGE_MAX_CHARS])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        stack = "".join(
+            traceback.format_exception(type(exc), exc, tb if tb is not None else exc.__traceback__)
+        )
+        if stack:
+            span.set_attr(STACK_ATTR, _clip_stack(stack))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        span.set_status(500)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _httpx_error_send(original: Any) -> Any:
+    """Per-client send wrapper: hooks own the span lifecycle, this only
+    completes it when the call fails. Works bound (instance) — signature
+    agnostic so sync and async clients share it."""
+
+    if inspect.iscoroutinefunction(original):
+
+        @functools.wraps(original)
+        async def send_async(*args: Any, **kwargs: Any):
+            try:
+                return await original(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - the error itself propagates
+                _httpx_finish_error(exc)
+                raise
+
+        send_async._dataflow_instrumented = True
+        send_async._dataflow_original = original
+        return send_async
+
+    @functools.wraps(original)
+    def send_sync(*args: Any, **kwargs: Any):
+        try:
+            return original(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the error itself propagates
+            _httpx_finish_error(exc)
+            raise
+
+    send_sync._dataflow_instrumented = True
+    send_sync._dataflow_original = original
+    return send_sync
+
+
+def _httpx_class_send(original: Any) -> Any:
+    """Class-level send patch (global mode): the wrapper owns the whole span
+    lifecycle — hooks stay untouched on every instance."""
+
+    if inspect.iscoroutinefunction(original):
+
+        @functools.wraps(original)
+        async def send_async(self: Any, request: Any, *args: Any, **kwargs: Any):
+            _httpx_start(request)
+            try:
+                response = await original(self, request, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - the error itself propagates
+                _httpx_finish_error(exc)
+                raise
+            _httpx_finish_ok(response)
+            return response
+
+        send_async._dataflow_instrumented = True
+        send_async._dataflow_original = original
+        return send_async
+
+    @functools.wraps(original)
+    def send_sync(self: Any, request: Any, *args: Any, **kwargs: Any):
+        _httpx_start(request)
+        try:
+            response = original(self, request, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the error itself propagates
+            _httpx_finish_error(exc)
+            raise
+        _httpx_finish_ok(response)
+        return response
+
+    send_sync._dataflow_instrumented = True
+    send_sync._dataflow_original = original
+    return send_sync
+
+
+# -- celery --------------------------------------------------------------------
+
+_CELERY_DISPATCH_UID = "dataflow.celery"
+
+# task_id -> (span, contextvar token). Tasks run to completion in one worker
+# context, so entries live for the span of a single task execution.
+_celery_lock = threading.Lock()
+_celery_spans: Dict[str, Tuple[Any, Any]] = {}
+
+
+def instrument_celery() -> None:
+    """Trace every celery task as a FUNCTION_CALL span.
+
+        dataflow.instrument_celery()
+        dataflow.uninstrument_celery()      # undo
+
+    Connects celery's ``task_prerun`` / ``task_postrun`` / ``task_failure``
+    signals: the span is named after the task (``"tasks.add"``), stays the
+    current span while the task body runs (so database and HTTP spans nest
+    under it), ends with the task state on ``task_postrun``, and failures
+    are recorded on ``task_failure`` with status 500, the
+    ``"Type: message"`` error and an ``error.stack``. ``celery`` is imported
+    lazily; a clear ImportError is raised here only when it is not
+    installed. Idempotent (registered under one dispatch_uid). The receivers
+    never raise, so the remaining handlers in the signal chain always run,
+    and uninstrumenting touches only the Dataflow receivers.
+    """
+    try:
+        import celery  # noqa: F401 - availability check only
+    except ImportError as exc:
+        raise ImportError(
+            "dataflow.instrument_celery requires the 'celery' package; "
+            "install it with: pip install celery"
+        ) from exc
+    from celery.signals import task_failure, task_postrun, task_prerun
+
+    # dispatch_uid keeps the registration idempotent (reconnecting replaces
+    # the receiver instead of stacking a second one).
+    task_prerun.connect(_celery_prerun, dispatch_uid=_CELERY_DISPATCH_UID)
+    task_postrun.connect(_celery_postrun, dispatch_uid=_CELERY_DISPATCH_UID)
+    task_failure.connect(_celery_failure, dispatch_uid=_CELERY_DISPATCH_UID)
+
+
+def uninstrument_celery() -> None:
+    """Disconnect the Dataflow celery receivers. No-op when celery is not
+    installed or nothing is connected; unrelated receivers stay untouched."""
+    try:
+        from celery.signals import task_failure, task_postrun, task_prerun
+    except ImportError:  # noqa: BLE001 - nothing to undo without celery
+        return
+    for signal in (task_prerun, task_postrun, task_failure):
+        try:
+            signal.disconnect(dispatch_uid=_CELERY_DISPATCH_UID)
+        except Exception:  # noqa: BLE001 - uninstrument is best-effort
+            pass
+    with _celery_lock:
+        _celery_spans.clear()
+
+
+def _celery_prerun(sender: Any = None, **kwargs: Any) -> None:
+    if not enabled():
+        return
+    try:
+        task = kwargs.get("task", sender)
+        name = _celery_task_name(task, kwargs.get("task_id"))
+        span = start_span(name, EVENT_FUNC_CALL)
+        token = _current_span.set(span)
+        with _celery_lock:
+            _celery_spans[_celery_key(kwargs.get("task_id"))] = (span, token)
+    except Exception:  # noqa: BLE001 - never break the signal chain
+        pass
+
+
+def _celery_postrun(sender: Any = None, **kwargs: Any) -> None:
+    with _celery_lock:
+        entry = _celery_spans.pop(_celery_key(kwargs.get("task_id")), None)
+    if entry is None:
+        return
+    span, token = entry
+    try:
+        _current_span.reset(token)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        state = str(kwargs.get("state") or "")
+        span.set_status(500 if state == "FAILURE" else 200)
+        span.end()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _celery_failure(sender: Any = None, **kwargs: Any) -> None:
+    with _celery_lock:
+        entry = _celery_spans.get(_celery_key(kwargs.get("task_id")))
+    if entry is None:  # postrun already ran, or prerun never did
+        return
+    span = entry[0]
+    exc = kwargs.get("exception")
+    try:
+        if exc is not None:
+            _record_exception(span, exc, kwargs.get("traceback"))
+        else:
+            span.record_error("task failed")
+            span.set_status(500)
+    except Exception:  # noqa: BLE001 - never break the signal chain
+        pass
+
+
+def _celery_task_name(task: Any, task_id: Any) -> str:
+    for attr in ("name", "__name__"):
+        name = getattr(task, attr, None)
+        if isinstance(name, str) and name:
+            return name
+    return str(task_id or "task")
+
+
+def _celery_key(task_id: Any) -> str:
+    return str(task_id or "")
 
 
 # -- Django ----------------------------------------------------------------------
