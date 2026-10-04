@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 # generated during the Docker build (grpcio-tools) — see README.md
 dataflow/proto_gen/
+*.egg-info/
