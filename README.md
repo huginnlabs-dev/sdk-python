@@ -1,4 +1,11 @@
+<div align="center">
+
+  <img src="assets/mark.svg" width="72" alt="Dataflow mark" />
+
 # HuginnLabs Dataflow — Python SDK
+
+</div>
+
 
 Runtime tracing for Python services, wire-compatible with the Go SDK: spans
 stream to the SaaS ingestion API over gRPC, payloads are sealed client-side
